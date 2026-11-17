@@ -212,6 +212,36 @@ the id of a session on this PC. Its tiles carry a **sandbox** badge and offer no
 `claude --resume` line. The server never reads `sandboxed/`, so a sandbox can't
 add a project, free a slot or hold the queue.
 
+## Sessions in VS Code (classic hook)
+
+Clients that don't run the mod, such as the VS Code extension, can still put a tile
+on the board through ordinary hooks. `classic-hook/board-hook.mjs` writes the same
+status file from the hook events, and keeps it fresh with a small detached heartbeat
+that lives as long as the session's `claude` process (`CLAUDE_PID`).
+
+The tile is plainer than a mod's: state, prompt, skill, work item, branch and
+recent tools, but no memory, cost, context, agents or crons. Where the mod runs
+too, it wins: the hook stamps `hookWrittenAt` on each write, and once `updatedAt`
+moves past that stamp the hook and its heartbeat leave the file alone.
+
+Add it to `~/.claude/settings.json`, one entry per event (Windows paths shown):
+
+```json
+{
+  "hooks": {
+    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "\"C:\\Program Files\\nodejs\\node.exe\" \"C:\\path\\to\\session-board\\classic-hook\\board-hook.mjs\"", "timeout": 10 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "PostToolUse":      [{ "matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }]
+  }
+}
+```
+
+Each event costs about 0.2 s (0.6 s for SessionStart, which asks git for the repo).
+
 ## Settings
 
 | Environment variable | Effect |
