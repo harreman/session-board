@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 // Writes the session-board status file from ordinary Claude Code hooks, for clients that
-// don't run the mod in hooks/ (the VS Code extension). Same file, same schema, fewer fields:
-// no memory samples, cost, context, agents or crons.
+// don't run the mod in hooks/ (the VS Code extension). Same file and schema as the mod, built
+// with the mod's own helpers from hooks/lib.ts (Node 22.18+ runs TypeScript directly).
 //
 // Hook events: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop,
 // SessionEnd — each runs `node board-hook.mjs` with the hook payload on stdin.
-// SessionStart also starts a detached heartbeat (`--heartbeat`), because the page treats a
-// file whose updatedAt stops moving for 20 s as a dead session.
+//
+// The first event also starts a detached heartbeat (`--heartbeat`). The page treats a file
+// whose updatedAt stops moving for 20 s as a dead session, and the heartbeat fills in what
+// hooks can't see: model, context, cache, title and turns from the transcript, and memory
+// from the mod's probe. Cost stays empty: the mod reads it from the engine, hooks can't.
 //
 // Where the mod also runs, it owns the file. Every write here stamps hookWrittenAt equal to
 // updatedAt; once updatedAt moves past that stamp, someone else is writing, and this hook
@@ -16,9 +19,16 @@ import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import {
+  PROBE, QUIET_TOOLS, cacheTtlOf, clip, freshBoard, memoryOf, parseMachine, parseProbe,
+  pushEvent, sessionTitleOf, slashCommand, summarize, toolLabel, workItemOf,
+} from '../hooks/lib.ts'
 
-const MAX_EVENTS = 80
-const HEARTBEAT_MS = 5_000
+const BEAT_MS = 5_000
+const SLOW_EVERY = 6 // beats between transcript reads (30 s)
+const MEMORY_EVERY = 12 // beats between memory samples (60 s)
+// The engine knows the real window; hooks don't. Claude 5 models run with 1M.
+const windowOf = (model, tokens) => (/\[1m\]|-5-|-5$/.test(model || '') || tokens > 200_000 ? 1_000_000 : 200_000)
 
 function boardDir() {
   if (process.env.SESSION_BOARD_DIR) return process.env.SESSION_BOARD_DIR
@@ -63,105 +73,35 @@ function git(cwd, args) {
 }
 
 function fresh(id, cwd, now) {
+  const board = freshBoard(id, cwd, now)
   const root = git(cwd, ['rev-parse', '--show-toplevel'])
-  const rootPath = root ? path.normalize(root) : null
-  return {
-    v: 1, sessionId: id, interactive: true, cwd,
-    project: path.basename(rootPath || cwd),
-    repo: rootPath ? { name: null, root: rootPath, remote: git(cwd, ['remote', 'get-url', 'origin']) } : null,
-    branch: git(cwd, ['branch', '--show-current']),
-    tabTitle: null, model: null,
-    startedAt: now, updatedAt: now, state: 'idle', stateSince: now, waiting: null,
-    prompt: null, promptAt: null, skill: null, activeSkill: null, workItem: null,
-    prs: [], turns: 0, tools: [], agents: [], events: [],
-    context: null, costUsd: null, cache: null, memory: null, machine: null,
-    crons: [], shells: [], messages: [], done: null,
-    client: 'classic-hook',
+  if (root) {
+    const rootPath = path.normalize(root)
+    board.project = path.basename(rootPath)
+    board.repo = { name: null, root: rootPath, remote: git(cwd, ['remote', 'get-url', 'origin']) }
   }
+  board.branch = git(cwd, ['branch', '--show-current'])
+  board.client = 'classic-hook'
+  return board
 }
 
-const clip = (s, n) => {
-  const t = String(s ?? '').replace(/\s+/g, ' ').trim()
-  return t.length > n ? `${t.slice(0, n - 1)}…` : t
-}
-
-function event(board, kind, text, t = Date.now()) {
-  board.events.push({ t, kind, text: clip(text, 140) })
-  if (board.events.length > MAX_EVENTS) board.events.splice(0, board.events.length - MAX_EVENTS)
-}
+const event = (board, kind, text, t) => pushEvent(board, { t, kind, text: clip(String(text ?? ''), 140) })
 
 function setState(board, state, t = Date.now()) {
   if (board.state !== state) { board.state = state; board.stateSince = t }
-}
-
-function toolLabel(name, input = {}) {
-  const mcp = /^mcp__(.+?)__(.+)$/.exec(name)
-  if (mcp) return `${mcp[1]} · ${mcp[2]}`
-  const detail = input.command ?? input.file_path ?? input.pattern ?? input.description ?? input.skill ?? ''
-  return detail ? `${name} · ${detail}` : name
-}
-
-function workItemOf(text) {
-  const m = /\bdeliver\b\D{0,20}?#?(\d{3,9})\b/i.exec(text || '')
-  return m ? m[1] : null
-}
-
-function startHeartbeat(file, board) {
-  if (board.hookHeartbeatPid && alive(board.hookHeartbeatPid)) return
-  const owner = process.env.CLAUDE_PID ? `pid:${process.env.CLAUDE_PID}` : String(process.ppid)
-  const child = spawn(process.execPath, [process.argv[1], '--heartbeat', file, owner],
-    { detached: true, stdio: 'ignore', windowsHide: true })
-  board.hookHeartbeatPid = child.pid
-  child.unref()
 }
 
 function alive(pid) {
   try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
 }
 
-// The heartbeat lives as long as the session's claude process. Claude sets CLAUDE_PID for its
-// children; without it, walk up from the hook's parent shell. That walk is a fallback only:
-// it takes seconds on Windows, and the shell may already be gone by then.
-function findClaudePid(start, done) {
-  const procs = new Map()
-  const walk = () => {
-    for (let pid = start, i = 0; procs.has(pid) && i < 8; pid = procs.get(pid).ppid, i++) {
-      if (/^claude/i.test(procs.get(pid).name)) return done(pid)
-    }
-    done(start)
-  }
-  const [cmd, args] = process.platform === 'win32'
-    ? ['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-        'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.Name)" }']]
-    : ['ps', ['-A', '-o', 'pid=,ppid=,comm=']]
-  let out = ''
-  const child = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
-  child.stdout.on('data', (d) => { out += d })
-  child.on('error', () => done(start))
-  child.on('close', () => {
-    for (const line of out.split(/\r?\n/)) {
-      const [pid, ppid, ...name] = line.trim().split(process.platform === 'win32' ? '\t' : /\s+/)
-      if (pid) procs.set(Number(pid), { ppid: Number(ppid), name: path.basename(name.join(' ')) })
-    }
-    walk()
-  })
-}
-
-async function heartbeat(file, ownerArg) {
-  let owner = null
-  if (ownerArg.startsWith('pid:')) owner = Number(ownerArg.slice(4))
-  else findClaudePid(Number(ownerArg), (pid) => { owner = pid })
-  for (;;) {
-    await new Promise((r) => setTimeout(r, HEARTBEAT_MS))
-    const board = load(file)
-    if (!board || ownedByMod(board) || board.state === 'ended') return
-    if (board.hookHeartbeatPid !== process.pid) return
-    if (owner !== null && !alive(owner)) {
-      setState(board, 'ended'); board.endReason = 'process gone'; event(board, 'session', 'session ended (process gone)')
-      save(file, board); return
-    }
-    save(file, board)
-  }
+function startHeartbeat(file, board) {
+  if (board.hookHeartbeatPid && alive(board.hookHeartbeatPid)) return
+  const owner = process.env.CLAUDE_PID || '0'
+  const child = spawn(process.execPath, [process.argv[1], '--heartbeat', file, owner],
+    { detached: true, stdio: 'ignore', windowsHide: true })
+  board.hookHeartbeatPid = child.pid
+  child.unref()
 }
 
 function handle(input) {
@@ -174,6 +114,7 @@ function handle(input) {
 
   const hookEvent = input.hook_event_name
   if (!board || (hookEvent === 'SessionStart' && board.state === 'ended')) board = fresh(id, input.cwd || process.cwd(), now)
+  if (input.transcript_path) board.transcriptPath = input.transcript_path
 
   switch (hookEvent) {
     case 'SessionStart':
@@ -181,51 +122,61 @@ function handle(input) {
       break
     case 'UserPromptSubmit': {
       const prompt = String(input.prompt || '')
+      const slash = slashCommand(prompt)
       board.prompt = clip(prompt, 300); board.promptAt = now; board.turns += 1; board.waiting = null
       setState(board, 'running', now)
       event(board, 'prompt', prompt, now)
-      const slash = /^\/([\w:.-]+)\s*([\s\S]*)$/.exec(prompt.trim())
       if (slash) {
-        board.skill = { name: slash[1], args: clip(slash[2], 200), at: now }
-        board.activeSkill = slash[1]
-        event(board, 'skill', `${slash[1]} ${slash[2]}`, now)
+        board.skill = { name: slash.name, args: slash.args, at: now }
+        board.activeSkill = slash.name
+        board.workItem = workItemOf(slash.args, true) ?? board.workItem
+        event(board, 'skill', `${slash.name} ${slash.args}`, now)
+      } else {
+        board.workItem = workItemOf(prompt, false) ?? board.workItem
       }
-      board.workItem = workItemOf(prompt) ?? board.workItem
       break
     }
     case 'PreToolUse': {
-      const name = input.tool_name || 'tool'
+      const tool = input.tool_name || 'tool'
       const ti = input.tool_input || {}
-      if (name === 'AskUserQuestion' || name === 'ExitPlanMode') {
-        const detail = name === 'ExitPlanMode' ? 'plan ready for review' : ti.questions?.[0]?.question
-        board.waiting = { kind: name === 'ExitPlanMode' ? 'plan' : 'question', detail: clip(detail, 200), tool: name, since: now }
+      if (tool === 'AskUserQuestion' || tool === 'ExitPlanMode') {
+        const detail = tool === 'ExitPlanMode' ? 'plan ready for review' : summarize(tool, ti)
+        board.waiting = { kind: tool === 'ExitPlanMode' ? 'plan' : 'question', detail, tool, since: now }
         setState(board, 'waiting', now)
-        event(board, 'waiting', detail || name, now)
+        event(board, 'waiting', detail || tool, now)
         break
       }
-      if (name === 'Skill' && ti.skill) {
-        board.skill = { name: ti.skill, args: clip(ti.args, 200), at: now }
+      if (tool === 'Skill' && typeof ti.skill === 'string') {
+        const args = typeof ti.args === 'string' ? ti.args : ''
+        board.skill = { name: ti.skill, args: clip(args, 200), at: now }
         board.activeSkill = ti.skill
-        board.workItem = workItemOf(`${ti.skill} ${ti.args || ''}`) ?? board.workItem
+        board.workItem = workItemOf(args, true) ?? board.workItem
+        event(board, 'skill', `${ti.skill} ${args}`, now)
       }
       board.waiting = null
       setState(board, 'running', now)
-      event(board, 'tool', toolLabel(name, ti), now)
+      board.tools = [{ id: input.tool_use_id || String(now), tool: toolLabel(tool), summary: summarize(tool, ti), since: now }]
+      if (!QUIET_TOOLS.has(tool) && tool !== 'Skill') {
+        const summary = summarize(tool, ti)
+        event(board, 'tool', summary ? `${toolLabel(tool)} · ${summary}` : toolLabel(tool), now)
+      }
       break
     }
     case 'PostToolUse':
       board.waiting = null
+      board.tools = []
       setState(board, 'running', now)
       break
     case 'Notification':
       if (input.notification_type === 'permission_prompt' || /permission/i.test(input.message || '')) {
-        board.waiting = { kind: 'question', detail: clip(input.message, 200), since: now }
+        board.waiting = { kind: 'question', detail: clip(String(input.message || ''), 200), since: now }
         setState(board, 'waiting', now)
         event(board, 'waiting', input.message || 'permission needed', now)
       }
       break
     case 'Stop': {
       board.waiting = null
+      board.tools = []
       setState(board, 'idle', now)
       const secs = board.promptAt ? Math.round((now - board.promptAt) / 1000) : null
       event(board, 'turn', secs == null ? 'turn done' : `turn done in ${secs}s`, now)
@@ -233,6 +184,7 @@ function handle(input) {
     }
     case 'SessionEnd':
       board.waiting = null
+      board.tools = []
       setState(board, 'ended', now)
       board.endReason = input.reason || 'ended'
       event(board, 'session', `session ended (${board.endReason})`, now)
@@ -243,6 +195,125 @@ function handle(input) {
   // Not only on SessionStart: a session already open when the hook was installed never sees one.
   if (board.state !== 'ended') startHeartbeat(file, board)
   save(file, board)
+}
+
+// ---- Heartbeat ----------------------------------------------------------------
+
+// What the transcript says, read incrementally: only bytes added since the last read.
+function transcriptReader() {
+  const st = { path: null, offset: 0, rest: '', prompts: new Set(), lastPrompt: null, model: null, usage: null, usageAt: 0, title: null, ttl: null }
+  return (file) => {
+    if (!file) return st
+    if (file !== st.path) Object.assign(st, { path: file, offset: 0, rest: '', prompts: new Set() })
+    let size
+    try { size = fs.statSync(file).size } catch { return st }
+    if (size < st.offset) Object.assign(st, { offset: 0, rest: '', prompts: new Set() })
+    if (size === st.offset) return st
+    const fd = fs.openSync(file, 'r')
+    const buf = Buffer.alloc(size - st.offset)
+    fs.readSync(fd, buf, 0, buf.length, st.offset)
+    fs.closeSync(fd)
+    st.offset = size
+    const text = st.rest + buf.toString('utf8')
+    const lines = text.split('\n')
+    st.rest = lines.pop() ?? ''
+    const chunk = lines.join('\n')
+    st.title = sessionTitleOf(chunk) ?? st.title
+    st.ttl = cacheTtlOf(chunk) ?? st.ttl
+    for (const line of lines) {
+      if (!line.includes('"type":"user"') && !line.includes('"type":"assistant"')) continue
+      let rec
+      try { rec = JSON.parse(line) } catch { continue }
+      if (rec.isSidechain) continue
+      if (rec.type === 'user' && rec.promptId && !rec.isMeta) {
+        const c = rec.message?.content
+        const isPrompt = typeof c === 'string' || (Array.isArray(c) && !c.some((p) => p.type === 'tool_result'))
+        const textPart = typeof c === 'string' ? c : Array.isArray(c) ? c.find((p) => p.type === 'text')?.text : null
+        if (isPrompt) {
+          st.prompts.add(rec.promptId)
+          if (textPart) st.lastPrompt = { text: textPart, at: Date.parse(rec.timestamp) || Date.now() }
+        }
+      }
+      if (rec.type === 'assistant' && rec.message?.usage) {
+        st.model = rec.message.model || st.model
+        st.usage = rec.message.usage
+        st.usageAt = Date.parse(rec.timestamp) || Date.now()
+      }
+    }
+    return st
+  }
+}
+
+function applyTranscript(board, st) {
+  if (st.model && st.model !== '<synthetic>') board.model = st.model
+  if (st.title) board.tabTitle = st.title
+  if (st.prompts.size > board.turns) board.turns = st.prompts.size
+  if (!board.prompt && st.lastPrompt) { board.prompt = clip(st.lastPrompt.text, 300); board.promptAt = st.lastPrompt.at }
+  const u = st.usage
+  if (u) {
+    const tokens = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
+    const window = windowOf(board.model, tokens)
+    board.context = { percent: Math.round((tokens / window) * 100), tokens, window }
+    if ((u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) > 0) {
+      board.cache = { at: st.usageAt, ttl: st.ttl ?? board.cache?.ttl ?? null }
+    }
+  }
+}
+
+function sampleMemory(owner, board, done) {
+  if (process.platform !== 'win32') return done()
+  const script = PROBE.replace('$root = ROOT', `$root = ${owner || 0}`)
+  let out = ''
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
+    { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+  child.stdout.on('data', (d) => { out += d })
+  child.on('error', () => done())
+  child.on('close', (code) => {
+    if (code !== 0) return done()
+    const at = Date.now()
+    const probe = parseProbe(out)
+    done({ machine: parseMachine(out, at), probe, at })
+  })
+}
+
+async function heartbeat(file, ownerArg) {
+  const owner = Number(ownerArg) || null
+  const read = transcriptReader()
+  let memory = null // the newest probe result, applied on the next beat
+  let probing = false
+  const mine = (b) => b && !ownedByMod(b) && b.state !== 'ended' && b.hookHeartbeatPid === process.pid
+  for (let beat = 0; ; beat++) {
+    let board = load(file)
+    if (!mine(board)) return
+    if (owner && !alive(owner)) {
+      setState(board, 'ended'); board.endReason = 'process gone'
+      event(board, 'session', 'session ended (process gone)', Date.now())
+      save(file, board); return
+    }
+    // Slow work first, then reload: a hook may have written meanwhile, and its write wins.
+    let st = null
+    let branch = null
+    if (beat % SLOW_EVERY === 0) {
+      try { st = read(board.transcriptPath) } catch {}
+      branch = git(board.cwd, ['branch', '--show-current'])
+      board = load(file)
+      if (!mine(board)) return
+    }
+    if (st) applyTranscript(board, st)
+    if (branch) board.branch = branch
+    if (memory) {
+      if (memory.machine) board.machine = memory.machine
+      const m = memory.probe ? memoryOf(memory.probe, memory.at, board.memory ?? null) : null
+      if (m) board.memory = m
+      memory = null
+    }
+    if (beat % MEMORY_EVERY === 0 && !probing) {
+      probing = true
+      sampleMemory(owner, board, (r) => { probing = false; memory = r ?? null })
+    }
+    save(file, board)
+    await new Promise((r) => setTimeout(r, BEAT_MS))
+  }
 }
 
 if (process.argv[2] === '--heartbeat') {

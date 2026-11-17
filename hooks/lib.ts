@@ -158,6 +158,33 @@ export type SessionMemory = {
 // page file; when it reaches the limit, allocations fail.
 export type MachineMemory = { at: number; ramMb: number; ramTotalMb: number; commitMb: number; commitLimitMb: number }
 
+// Lists the session's claude.exe and every process under it, with their memory,
+// as JSON. ROOT is the claude.exe PID, or 0 to find it: the nearest claude.exe
+// above this PowerShell. The probe leaves itself out. A child must be younger
+// than its parent, so a reused PID never adopts an unrelated process. It also
+// reports the machine's RAM and commit charge, even when it finds no claude.exe.
+// One line with single quotes only, since it goes through -Command.
+export const PROBE = [
+  "$ErrorActionPreference = 'Stop'",
+  '$os = Get-CimInstance Win32_OperatingSystem -Property TotalVisibleMemorySize,FreePhysicalMemory,TotalVirtualMemorySize,FreeVirtualMemory',
+  '$machine = [pscustomobject]@{ ramTotalMb = [Math]::Round($os.TotalVisibleMemorySize / 1KB); ramFreeMb = [Math]::Round($os.FreePhysicalMemory / 1KB); commitLimitMb = [Math]::Round($os.TotalVirtualMemorySize / 1KB); commitFreeMb = [Math]::Round($os.FreeVirtualMemory / 1KB) }',
+  '$all = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate)',
+  '$by = @{}',
+  '$kids = @{}',
+  'foreach ($p in $all) { $id = [int]$p.ProcessId; $by[$id] = $p; $pp = [int]$p.ParentProcessId; if (-not $kids.ContainsKey($pp)) { $kids[$pp] = New-Object System.Collections.ArrayList }; [void]$kids[$pp].Add($id) }',
+  '$root = ROOT',
+  "if ($root -eq 0 -and $by.ContainsKey($PID)) { $id = [int]$by[$PID].ParentProcessId; for ($i = 0; $i -lt 10 -and $by.ContainsKey($id); $i++) { if ($by[$id].Name -eq 'claude.exe') { $root = $id; break }; $id = [int]$by[$id].ParentProcessId } }",
+  "if ($root -eq 0 -or -not $by.ContainsKey($root)) { [pscustomobject]@{ machine = $machine } | ConvertTo-Json -Compress -Depth 3; exit 0 }",
+  '$ids = New-Object System.Collections.ArrayList',
+  '$queue = New-Object System.Collections.Queue',
+  '$queue.Enqueue($root)',
+  'while ($queue.Count) { $id = $queue.Dequeue(); if ($id -eq $PID -or $ids.Contains($id)) { continue }; [void]$ids.Add($id); if ($kids.ContainsKey($id)) { foreach ($k in $kids[$id]) { if ($by[$k].CreationDate -ge $by[$id].CreationDate) { $queue.Enqueue($k) } } } }',
+  '$mem = @{}',
+  'foreach ($g in @(Get-Process -Id $ids -ErrorAction SilentlyContinue)) { $mem[$g.Id] = $g }',
+  '$out = foreach ($id in $ids) { $p = $by[$id]; $g = $mem[$id]; if ($g) { $c = [string]$p.CommandLine; [pscustomobject]@{ pid = $id; ppid = [int]$p.ParentProcessId; name = [string]$p.Name; cmd = $c.Substring(0, [Math]::Min(300, $c.Length)); mb = [Math]::Round($g.PrivateMemorySize64 / 1MB); wsMb = [Math]::Round($g.WorkingSet64 / 1MB) } } }',
+  '[pscustomobject]@{ root = $root; procs = @($out); machine = $machine } | ConvertTo-Json -Compress -Depth 3',
+].join('; ')
+
 export const MEMORY_HISTORY = 120 // two hours at one sample a minute
 
 export const MAX_EVENTS = 80

@@ -219,8 +219,10 @@ on the board through ordinary hooks. `classic-hook/board-hook.mjs` writes the sa
 status file from the hook events, and keeps it fresh with a small detached heartbeat
 that lives as long as the session's `claude` process (`CLAUDE_PID`).
 
-The tile is plainer than a mod's: state, prompt, skill, work item, branch and
-recent tools, but no memory, cost, context, agents or crons. Where the mod runs
+The tile matches a mod's, filled by the heartbeat: model, context, cache, title and
+turns from the transcript, memory from the mod's probe. Missing: cost (the mod reads
+it from the engine; hooks can't), agents and crons. Needs Node 22.18+, which runs
+`hooks/lib.ts` directly. Where the mod runs
 too, it wins: the hook stamps `hookWrittenAt` on each write, and once `updatedAt`
 moves past that stamp the hook and its heartbeat leave the file alone.
 
@@ -240,7 +242,7 @@ Add it to `~/.claude/settings.json`, one entry per event (Windows paths shown):
 }
 ```
 
-Each event costs about 0.2 s (0.6 s for SessionStart, which asks git for the repo).
+Each event costs about 0.3 s (0.8 s for the first, which asks git for the repo).
 
 ## Settings
 
