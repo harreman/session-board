@@ -121,6 +121,18 @@ function clearWaiting(board, agentId) {
   if (board.waiting && (board.waiting.agentId ?? undefined) === agentId) board.waiting = null
 }
 
+// Tool-call hooks run with `"async": true` and `--async`, so a tool call doesn't wait on them.
+// Async runs can land in any order, even after the turn's Stop, so they never change whether
+// the main turn runs, and clear only a permission prompt (the tool running means it was
+// answered). Questions and plan reviews come through separate, synchronous entries.
+const ASYNC = process.argv.includes('--async')
+const ASKS = new Set(['AskUserQuestion', 'ExitPlanMode'])
+
+function clearWaitingAsync(board, agentId) {
+  if (!ASYNC) return clearWaiting(board, agentId)
+  if (board.waiting && !board.waiting.tool && (board.waiting.agentId ?? undefined) === agentId) board.waiting = null
+}
+
 function agentEnded(board, agent, status, t) {
   agent.status = status
   agent.endedAt ??= t
@@ -206,7 +218,8 @@ function handle(input) {
     case 'PreToolUse': {
       const tool = input.tool_name || 'tool'
       const ti = input.tool_input || {}
-      if (!agentId) board.hookMainRunning = true
+      if (ASYNC && ASKS.has(tool)) return
+      if (!agentId && !ASYNC) board.hookMainRunning = true
       if (tool === 'AskUserQuestion' || tool === 'ExitPlanMode') {
         const detail = tool === 'ExitPlanMode' ? 'plan ready for review' : summarize(tool, ti)
         board.waiting = { kind: tool === 'ExitPlanMode' ? 'plan' : 'question', detail, tool, since: now, ...(agentId ? { agentId } : {}) }
@@ -220,7 +233,7 @@ function handle(input) {
         board.workItem = workItemOf(args, true) ?? board.workItem
         event(board, 'skill', `${ti.skill} ${args}`, now)
       }
-      clearWaiting(board, agentId)
+      clearWaitingAsync(board, agentId)
       const rec = { id: input.tool_use_id || String(now), tool: toolLabel(tool), summary: summarize(tool, ti), ...(agentId ? { agentId } : {}), since: now }
       // One call per thread: hooks see every call start, but an end only for the tools PostToolUse matches.
       board.tools = [...(board.tools ?? []).filter((t) => (t.agentId ?? undefined) !== agentId), rec]
@@ -246,8 +259,9 @@ function handle(input) {
       const tool = input.tool_name || 'tool'
       const ti = input.tool_input || {}
       const r = input.tool_response
-      if (!agentId) board.hookMainRunning = true
-      clearWaiting(board, agentId)
+      if (ASYNC && ASKS.has(tool)) return
+      if (!agentId && !ASYNC) board.hookMainRunning = true
+      clearWaitingAsync(board, agentId)
       board.tools = (board.tools ?? []).filter((t) => t.id !== input.tool_use_id)
       if (tool === 'Agent' || tool === 'Task') {
         const res = r && typeof r === 'object' ? r : {}

@@ -240,8 +240,10 @@ Add it to `~/.claude/settings.json`, one entry per event (Windows paths shown):
   "hooks": {
     "SessionStart":     [{ "hooks": [{ "type": "command", "command": "\"C:\\Program Files\\nodejs\\node.exe\" \"C:\\path\\to\\session-board\\classic-hook\\board-hook.mjs\"", "timeout": 10 }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
-    "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
-    "PostToolUse":      [{ "matcher": "AskUserQuestion|ExitPlanMode|Agent|Task|CronCreate|CronDelete|CronList|ScheduleWakeup|Bash|PowerShell|Monitor|TaskStop", "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "<same> --async", "async": true, "timeout": 5 }] },
+                         { "matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "PostToolUse":      [{ "matcher": "Agent|Task|CronCreate|CronDelete|CronList|ScheduleWakeup|Bash|PowerShell|Monitor|TaskStop", "hooks": [{ "type": "command", "command": "<same> --async", "async": true, "timeout": 5 }] },
+                         { "matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
     "Notification":     [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
     "Stop":             [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
     "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
@@ -251,8 +253,12 @@ Add it to `~/.claude/settings.json`, one entry per event (Windows paths shown):
 }
 ```
 
-Each event costs about 0.3 s (0.8 s for the first, which asks git for the repo). The
-PostToolUse matcher includes Bash, so every Bash call pays that once more.
+Each synchronous event costs about 0.3 s (0.8 s for the first, which asks git for the
+repo). Tool calls don't pay it: their hooks run with `"async": true`, so Claude doesn't
+wait. Async runs can land out of order — even after the turn's Stop — so with `--async`
+the hook never changes whether the main turn is running and clears only a permission
+prompt. Questions and plan reviews go through the synchronous AskUserQuestion|ExitPlanMode
+entries, which keep "needs you" exact.
 
 ## Settings
 
