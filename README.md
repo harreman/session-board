@@ -220,8 +220,15 @@ status file from the hook events, and keeps it fresh with a small detached heart
 that lives as long as the session's `claude` process (`CLAUDE_PID`).
 
 The tile matches a mod's, filled by the heartbeat: model, context, cache, title and
-turns from the transcript, memory from the mod's probe. Missing: cost (the mod reads
-it from the engine; hooks can't), agents and crons. Needs Node 22.18+, which runs
+turns from the transcript, memory from the mod's probe. Subagents, background shells
+and scheduled jobs come from the hook events, with the mod's own helpers: an Agent call
+and `SubagentStart` add an agent, `SubagentStop` or the call's result ends it, and calls
+made inside a subagent carry its `agent_id`, so they're tagged with it and leave the main
+thread's state alone (a tile shows *background* while only subagents work). `Stop` and
+`SubagentStop` list the session's background tasks and scheduled jobs, which settles
+anything a hook missed. A finished background shell's notification reaches hooks only
+if it starts a turn; otherwise the shell goes at the next `Stop` or after two hours.
+Missing: cost (the mod reads it from the engine; hooks can't). Needs Node 22.18+, which runs
 `hooks/lib.ts` directly. Where the mod runs
 too, it wins: the hook stamps `hookWrittenAt` on each write, and once `updatedAt`
 moves past that stamp the hook and its heartbeat leave the file alone.
@@ -234,15 +241,18 @@ Add it to `~/.claude/settings.json`, one entry per event (Windows paths shown):
     "SessionStart":     [{ "hooks": [{ "type": "command", "command": "\"C:\\Program Files\\nodejs\\node.exe\" \"C:\\path\\to\\session-board\\classic-hook\\board-hook.mjs\"", "timeout": 10 }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
     "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
-    "PostToolUse":      [{ "matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "PostToolUse":      [{ "matcher": "AskUserQuestion|ExitPlanMode|Agent|Task|CronCreate|CronDelete|CronList|ScheduleWakeup|Bash|PowerShell|Monitor|TaskStop", "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
     "Notification":     [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
     "Stop":             [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }],
     "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "<same>", "timeout": 5 }] }]
   }
 }
 ```
 
-Each event costs about 0.3 s (0.8 s for the first, which asks git for the repo).
+Each event costs about 0.3 s (0.8 s for the first, which asks git for the repo). The
+PostToolUse matcher includes Bash, so every Bash call pays that once more.
 
 ## Settings
 
